@@ -1,0 +1,194 @@
+#!/bin/bash
+# Create SSL certificates
+# Brendan Scullion
+#
+
+# exit script if any of the commands fail
+set -e
+
+# You can change these default values to suit
+DAYS=3650
+
+CERT_DIR=/etc/ssl/certs
+PRIVATE_KEY_DIR=/etc/ssl/private
+
+e_curve=prime256v1
+localRootCA=$CERT_DIR/myLocalRootCA.crt
+localRootCAkey=$PRIVATE_KEY_DIR/myLocalRootCA.key
+
+EXTFILE=/tmp/_v3.ext
+
+ORG="Local CA $(hostname)"
+ORG_UNIT="IT"
+COUNTY="DUBLIN"
+STATE="Leinster"
+COUNTRY="IE"
+
+function show_usage()
+{
+    echo "makecrt"
+    echo " "
+    echo "Usage: ./makecrt -d [domain1, domain2...] [options]"
+    echo " "
+    echo "options:"
+    echo "-h, --help           show brief help"
+    echo "-d, --domains <DOMAIN1 DOMAIN2...> Specify domain for which the cert will be used on"
+    echo "     --days          Specify how long the cert is valid for. default: ${DAYS}"
+    echo "     --CA            Specify a local CA. default: ${localRootCA}"
+    echo "     --CAkey         Specify a local CA private key. default: ${localRootCAkey}"
+    echo "-pd, --private-dir   Specify private key dir. default: ${PRIVATE_KEY_DIR}"
+    echo "-cd, --cert-dir      Specify certificate dir. default: ${CERT_DIR}"
+    echo "-e, --eliptic-curve  Specify what type of eliptic curve to use. Default: ${e_curve}"
+    echo " "
+    echo "Example:"
+    echo "./makecrt -d example.com blog.example.com"
+    echo " "
+}
+
+function confirmContinue(){
+    read -p "$1 (y/n)?" choice
+    case "$choice" in 
+        y|Y|yes|Yes|YES ) 
+            echo "continue"
+            ;;
+        n|N|no|No|NO )
+            exit 0
+            ;;
+        * ) 
+            echo "invalid"
+            confirmContinue $1
+            ;;
+    esac
+}
+
+while test $# -gt 0; do
+    case "$1" in
+        --help)
+            show_usage
+            exit 0
+            ;;
+        -d|--domains)
+            shift
+            domains=($1)
+            shift
+            while test $# -gt 0; do 
+                if [[ $1 == -* ]]; then
+                    break
+                fi
+                domains+=($1)
+                shift
+            done
+            ;;
+        --days)
+            shift
+            DAYS=$1
+            shift
+            ;;
+        --CA)
+            shift
+            localRootCA=$1
+            shift
+            ;;
+        --CAkey)
+            shift
+            localRootCAkey=$1
+            shift
+            ;;
+
+        -pd|--private-dir)
+            shift
+            PRIVATE_KEY_DIR=$1
+            shift
+            ;;
+        -cd|--cert-dir)
+            shift
+            CERT_DIR=$1
+            shift
+            ;;
+        -e|--eliptic-curve)
+            shift
+            e_curve=$1
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ -z "$domains" ]; then
+    show_usage
+    exit 10
+fi
+
+
+
+# If there's no certificate authority then we should create one.
+if [ ! -f $localRootCA ]; then
+    echo "Certificate authority does not exist, creating..."
+    CASUBJ="/C=${COUNTRY}/ST=${STATE}/L=${COUNTY}/O=${ORG}/OU=${ORG_UNIT}/CN=${domains[0]}"
+    openssl ecparam -genkey -name ${e_curve} -out $localRootCAkey
+    openssl req -x509 -new -sha256 -nodes -key $localRootCAkey -days $DAYS -out $localRootCA -subj "$CASUBJ"
+    chmod 400 $localRootCAkey
+fi
+
+
+if [ ! -f $localRootCA ]; then
+    echo "Local Certificate Authority does not exits: ${localRootCA}"
+    exit 1
+fi
+
+domain_key=$PRIVATE_KEY_DIR/${domains[0]}.key
+domain_cert=$CERT_DIR/${domains[0]}.crt
+domain_csr=/tmp/${domains[0]}.csr
+SUBJ="/C=${COUNTRY}/ST=${STATE}/L=${COUNTY}/O=${ORG}/OU=${ORG_UNIT}/CN=${domains[0]}"
+
+# Confirm overwrite if certs already exist
+if [ -f $domain_key ]; then
+    confirmContinue "$domain_key exists! overwrite?"
+fi
+if [ -f $domain_cert ]; then
+    confirmContinue "$domain_cert exists! overwrite?"
+fi
+
+echo "Creating extfile"
+
+cat << EOF > ${EXTFILE}
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+EOF
+
+# Add all domains and Alt names
+x=1
+for i in ${domains[@]}
+do 
+  echo DNS.$x = $i >> $EXTFILE
+  let x=x+1
+done
+
+
+echo "Creating certificate for ${domains[0]}"
+
+# Create Host Key
+openssl ecparam -genkey -name ${e_curve} -out  ${domain_key}
+chmod 400 $domain_key
+
+#Create Certitficarte signing request
+openssl req -new -sha256 -key ${domain_key} -nodes -out ${domain_csr} -subj "$SUBJ"
+
+#Create Signed Request
+openssl x509 -req -sha256 \
+    -days $DAYS -in ${domain_csr} \
+    -CA $localRootCA \
+    -CAkey $localRootCAkey \
+    -CAcreateserial -out ${domain_cert} \
+    -extfile $EXTFILE
+
+echo "NGINX config:"
+echo "ssl_certificate_key:  ${domain_key};"
+echo "ssl_certificate:  ${domain_key};"
+
